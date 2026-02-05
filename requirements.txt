@@ -8,3 +8,5 @@ langgraph
 langchain-openai
 pypdf
 markdown
+langchain-mistralai
+python-dotenv
