@@ -10,3 +10,5 @@ pypdf
 markdown
 langchain-mistralai
 python-dotenv
+tavily-python
+xhtml2pdf
