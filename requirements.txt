@@ -1,14 +1,28 @@
+# --- Core & Orchestration ---
 langchain
 langchain-community
-langchain-huggingface
+langgraph
+python-dotenv
+
+# --- LLM Providers ---
+langchain-mistralai
+langchain-openai
+
+# --- RAG & Vector Stores ---
 langchain-chroma
 chromadb
+langchain-huggingface
 sentence-transformers
-langgraph
-langchain-openai
+
+# --- Document Processing ---
 pypdf
 markdown
-langchain-mistralai
-python-dotenv
-tavily-python
 xhtml2pdf
+
+# --- Tools & Search ---
+tavily-python
+
+# --- Monitoring & Data ---
+mlflow
+pandas
+spacy

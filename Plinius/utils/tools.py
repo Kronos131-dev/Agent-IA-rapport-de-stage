@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain.tools import tool
 from tavily import TavilyClient
-from Plinius.utils.rag_config import get_embeddings, CHROMA_DB_DIR
+from Plinius.utils.rag_config import get_embeddings, CHROMA_DB_DIR, STYLE_DB_DIR
 
 # Chargement des variables d'environnement
 load_dotenv()
@@ -12,11 +12,12 @@ load_dotenv()
 _vectorstore = None
 
 def get_vectorstore():
-    """Singleton pour l'accès à la base vectorielle des notes."""
     global _vectorstore
     if _vectorstore is None:
         if not os.path.exists(CHROMA_DB_DIR):
-            raise FileNotFoundError(f"Base vectorielle introuvable dans {CHROMA_DB_DIR}.")
+            # On ne lève plus d'erreur bloquante, on retourne None pour gérer le cas "pas encore ingéré"
+            print(f"Attention : Base vectorielle introuvable dans {CHROMA_DB_DIR}.")
+            return None
         embeddings = get_embeddings()
         _vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings)
     return _vectorstore
@@ -26,6 +27,7 @@ def search_documents(query: str) -> str:
     """Recherche dans les notes de stage de l'utilisateur."""
     try:
         vs = get_vectorstore()
+        if not vs: return "Aucune note disponible (base vectorielle vide)."
         results = vs.similarity_search(query, k=5)
         if not results: return "Aucune info trouvée."
         return "\n\n".join([f"[Note]: {doc.page_content}" for doc in results])
@@ -34,10 +36,8 @@ def search_documents(query: str) -> str:
 
 # --- RAG Style (Forme) ---
 _style_vectorstore = None
-STYLE_DB_DIR = "./chroma_style_db"
 
 def get_style_vectorstore():
-    """Singleton pour l'accès à la base vectorielle du guide de style."""
     global _style_vectorstore
     if _style_vectorstore is None:
         if not os.path.exists(STYLE_DB_DIR):
@@ -49,8 +49,7 @@ def get_style_vectorstore():
 @tool
 def consult_style_guide(query: str) -> str:
     """
-    Consulte l'exemple de rapport de stage (PDF) pour s'inspirer de la mise en page,
-    du ton, ou de la structure.
+    Consulte l'exemple de rapport de stage (PDF) pour s'inspirer de la mise en page.
     """
     try:
         vs = get_style_vectorstore()
@@ -62,22 +61,17 @@ def consult_style_guide(query: str) -> str:
 
 # --- Web Search (Tavily Client Direct) ---
 
-# Initialisation du client Tavily
 tavily_api_key = os.getenv("TAVILY_API_KEY")
 tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
 
 @tool
 def internet_search(query: str):
-    """Effectue une recherche internet avancée via Tavily."""
+    """Does an internet research using Tavily Advanced Search."""
     if not tavily_client:
         return "Erreur: Clé API Tavily non configurée."
     
     try:
-        # Utilisation directe du client comme demandé
         result = tavily_client.search(query, search_depth="advanced")
-        
-        # On formate un peu le résultat pour le LLM (Tavily renvoie un dict complexe)
-        # On extrait les résultats pertinents
         if 'results' in result:
             formatted_results = "\n".join([f"- {res['content']} ({res['url']})" for res in result['results'][:3]])
             return formatted_results

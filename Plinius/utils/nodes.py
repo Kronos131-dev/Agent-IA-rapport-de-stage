@@ -2,326 +2,346 @@ import os
 import markdown
 import re
 import json
+import traceback
 from xhtml2pdf import pisa
 from datetime import datetime
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
+try:
+    from langchain_core.pydantic_v1 import BaseModel, Field
+except ImportError:
+    from pydantic import BaseModel, Field
+from typing import List
+
 from Plinius.utils.state import AgentState
 from Plinius.utils.llm_config import get_llm
 from Plinius.utils.tools import search_documents, internet_search, consult_style_guide
+from Plinius.utils.security import validate_input, sanitize_output
+from Plinius.utils import prompts
+
+# --- Configuration des chemins ---
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- Modèles Pydantic ---
+class PartiePlan(BaseModel):
+    titre: str = Field(description="Le titre de la partie technique")
+    contenu: str = Field(description="Description détaillée du contenu")
+
+class PlanRapport(BaseModel):
+    parties: List[PartiePlan] = Field(description="Liste des parties techniques")
 
 # --- Helper de nettoyage ---
-
 def clean_markdown(text: str) -> str:
-    """Nettoie le markdown généré par le LLM."""
     if not text: return ""
+    text = sanitize_output(text)
     text = re.sub(r"```markdown\s*", "", text)
     text = re.sub(r"```\s*", "", text)
     text = re.sub(r"[■□▼▲]{3,}", "", text)
     text = re.sub(r"[-=_]{5,}", "", text)
     text = text.replace("■", "-").replace("□", "-").replace("▼", "v").replace("▲", "^")
     text = text.replace("ᵉʳ", "er")
-    
+    text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
+    text = re.sub(r"<img.*?>", "", text)
+    text = re.sub(r"^(Voici|Je vous propose|Ci-dessous).*?:\n", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    stop_patterns = [r"\nNotes? de personnalisation", r"\nNotes? pour", r"\nConseils? :", r"\nExemple d['’]adaptation", r"\n---"]
+    for pattern in stop_patterns:
+        split_text = re.split(pattern, text, flags=re.IGNORECASE)
+        if len(split_text) > 1: text = split_text[0]
     lines = text.split('\n')
     cleaned_lines = []
     for line in lines:
         if line.strip().startswith('#'):
             line = line.replace('**', '')
-            if " : " in line:
-                line = line.split(" : ")[0]
+            if " : " in line: line = line.split(" : ")[0]
         cleaned_lines.append(line)
-    
     return '\n'.join(cleaned_lines).strip()
 
 # --- Helper générique ---
-
 def call_llm(system_prompt: str, user_prompt: str, state: AgentState):
-    """Appel simple au LLM avec gestion du feedback."""
     llm = get_llm()
-    messages = [SystemMessage(content=system_prompt)]
-    
+    full_system_prompt = f"{prompts.SECURITY_SYSTEM_PROMPT}\n\n--- TÂCHE SPÉCIFIQUE ---\n{system_prompt}"
+    messages = [SystemMessage(content=full_system_prompt)]
     content = user_prompt
     feedback = state.get("user_feedback")
     previous_output = state.get("previous_output")
-    
-    if feedback and previous_output:
-        content += f"\n\n--- MODE CORRECTION ---\nPrécédent refusé :\n{previous_output}\n\nFeedback :\n{feedback}\n\nCorrige en conséquence."
-        
+    if feedback:
+        if not validate_input(feedback): feedback = "Feedback ignoré."
+        if previous_output: content += f"\n\n--- MODE CORRECTION ---\nPrécédent refusé :\n{previous_output}\n\nFeedback :\n{feedback}\n\nCorrige en conséquence."
     messages.append(HumanMessage(content=content))
     response = llm.invoke(messages).content
     return clean_markdown(response)
 
-# --- Implémentation des Noeuds ---
+# --- NOEUDS ---
 
 def noeud_orchestrateur(state: AgentState):
     print("\n[Orchestrateur] Analyse...")
     last = state.get("last_validated")
     current = state.get("current_node")
-    
     sequence = ["contexte", "corps_rapport", "introduction", "conclusion", "mise_en_page", "generation", "conversion_pdf"]
-    
-    if not last:
-        next_node = "contexte"
+    if not last: next_node = "contexte"
     else:
-        try:
-            idx = sequence.index(last)
-            next_node = sequence[idx + 1] if idx + 1 < len(sequence) else "conversion_pdf"
-        except ValueError:
-            next_node = "conversion_pdf"
-
+        try: idx = sequence.index(last); next_node = sequence[idx + 1] if idx + 1 < len(sequence) else "conversion_pdf"
+        except ValueError: next_node = "conversion_pdf"
     updates = {"current_node": next_node, "human_approved": False}
-    
     if next_node != current:
         print(f"[Orchestrateur] -> {next_node}")
-        updates["user_feedback"] = None
-        updates["previous_output"] = None
-        updates["revision_count"] = 0
+        updates.update({"user_feedback": None, "previous_output": None, "revision_count": 0})
     else:
         print(f"[Orchestrateur] Révision pour {next_node}")
         updates["revision_count"] = state.get("revision_count", 0) + 1
-
     return updates
 
 def demande_infos_contexte(state: AgentState):
-    print("--- Tâche : Contexte & Infos Complètes ---")
+    print("--- Tâche : Contexte & Infos ---")
     llm = get_llm()
     parser = JsonOutputParser()
+    rag_notes = search_documents.invoke("Infos administratives stage entreprise tuteur maître de stage université formation sujet étudiant contact dates")
     
-    rag_notes = search_documents.invoke("Infos administratives stage entreprise tuteur maître de stage université formation")
-    
-    # 1. Extraction initiale
-    extraction_prompt = """Analyse le texte ci-dessous (Notes).
-    Identifie les entités nommées.
-    
-    Format JSON attendu :
-    {
-        "ENTREPRISE": "Nom ou INCONNU",
-        "TUTEUR_ENTREPRISE": "Nom ou INCONNU",
-        "ECOLE": "Nom ou INCONNU",
-        "FORMATION": "Nom ou INCONNU",
-        "TUTEUR_ECOLE": "Nom ou INCONNU"
-    }
-    """
-    
-    try:
-        response = llm.invoke([
-            SystemMessage(content=extraction_prompt),
-            HumanMessage(content=f"Texte : {rag_notes[:3000]}")
-        ])
-        infos = parser.parse(response.content)
-    except Exception as e:
-        print(f"   [Erreur Extraction] {e}. Utilisation valeurs par défaut.")
-        infos = {k: "INCONNU" for k in ["ENTREPRISE", "TUTEUR_ENTREPRISE", "ECOLE", "FORMATION", "TUTEUR_ECOLE"]}
-
-    # 2. Analyse du feedback (Correction JSON plus souple)
+    # 1. Récupération des infos existantes (si feedback) ou extraction initiale
+    existing_infos = state.get('context_data', {}).get('raw_infos', {})
     feedback = state.get("user_feedback")
-    if feedback:
-        print(f"   [Correction] Analyse du feedback : '{feedback}'")
-        feedback_prompt = """L'utilisateur donne une correction. Extrais les nouveaux noms si présents.
-        Si une info est mentionnée (même implicitement), mets-la à jour.
-        
-        Format JSON attendu :
-        {
-            "ENTREPRISE": "Nouveau Nom ou null",
-            "TUTEUR_ENTREPRISE": "Nouveau Nom ou null",
-            "ECOLE": "Nouveau Nom ou null",
-            "FORMATION": "Nouveau Nom ou null",
-            "TUTEUR_ECOLE": "Nouveau Nom ou null"
-        }
-        """
+    
+    if feedback and validate_input(feedback):
+        print(f"   [Correction] Analyse du feedback...")
+        infos = existing_infos.copy()
         try:
             fb_response = llm.invoke([
-                SystemMessage(content=feedback_prompt),
+                SystemMessage(content=prompts.SECURITY_SYSTEM_PROMPT + "\n" + prompts.FEEDBACK_CONTEXTE),
                 HumanMessage(content=f"Feedback : {feedback}")
             ])
             fb_infos = parser.parse(fb_response.content)
             
-            for key, val in fb_infos.items():
-                if val and val not in ["null", "None", "INCONNU", "NON_MENTIONNE"]:
-                    print(f"   -> Mise à jour {key} : {val}")
-                    infos[key] = val
-        except Exception as e:
-            print(f"   [Erreur Feedback] {e}")
+            # Mise à jour intelligente avec Reset des dépendances
+            for k, v in fb_infos.items():
+                if v and v not in ["null", "None", "INCONNU", "NON_MENTIONNE"]:
+                    print(f"   -> Mise à jour {k} : {v}")
+                    infos[k] = v
+                    
+                    # LOGIQUE DE RESET : Si l'école/formation change, on oublie le tuteur inventé pour forcer la recherche
+                    if k in ["ECOLE", "FORMATION"]:
+                        # On ne reset que si l'utilisateur n'a PAS donné le tuteur dans le même feedback
+                        if "TUTEUR_ECOLE" not in fb_infos or fb_infos["TUTEUR_ECOLE"] in ["null", "None", "INCONNU"]:
+                            print("   [Reset] Nouvelle formation/école détectée -> Recherche d'un nouveau tuteur...")
+                            infos["TUTEUR_ECOLE"] = "INCONNU"
+                    
+                    if k == "ENTREPRISE":
+                        if "TUTEUR_ENTREPRISE" not in fb_infos or fb_infos["TUTEUR_ENTREPRISE"] in ["null", "None", "INCONNU"]:
+                            print("   [Reset] Nouvelle entreprise détectée -> Recherche d'un nouveau tuteur...")
+                            infos["TUTEUR_ENTREPRISE"] = "INCONNU"
 
-    # 3. Recherches Web
-    web_infos = ""
+        except: pass
+    elif not existing_infos:
+        # Extraction initiale
+        try:
+            response = llm.invoke([
+                SystemMessage(content=prompts.SECURITY_SYSTEM_PROMPT + "\n" + prompts.EXTRACTION_CONTEXTE),
+                HumanMessage(content=f"Texte : {rag_notes[:3000]}")
+            ])
+            infos = parser.parse(response.content)
+        except:
+            infos = {k: "INCONNU" for k in ["ETUDIANT_NOM", "ETUDIANT_CONTACT", "ENTREPRISE", "TUTEUR_ENTREPRISE", "ECOLE", "FORMATION", "TUTEUR_ECOLE", "DATES_STAGE", "TITRE_STAGE"]}
+    else:
+        infos = existing_infos
+
+    # Nettoyage
+    for k, v in infos.items():
+        if v in ["None", "null", None]: infos[k] = "INCONNU"
+
+    invented_keys = set()
     missing_alerts = []
     
-    def search_and_log(key, query_template, label):
-        val = infos.get(key, "INCONNU")
-        val_clean = str(val).replace('"', '').replace("'", "").replace(".", "").strip()
+    # 2. Déduction Automatique (Email, Dates)
+    if infos.get("ETUDIANT_NOM") != "INCONNU" and (infos.get("ETUDIANT_CONTACT") == "INCONNU" or "email" in str(infos.get("ETUDIANT_CONTACT"))):
+        nom_clean = infos["ETUDIANT_NOM"].lower().replace(" ", ".").replace("é", "e")
+        infos["ETUDIANT_CONTACT"] = f"{nom_clean}@gmail.com"
+        print(f"   [Déduction] Email généré : {infos['ETUDIANT_CONTACT']}")
+
+    # 3. Résolution des Structures (Entreprise, Ecole, Formation)
+    keys_struct = ["ENTREPRISE", "ECOLE", "FORMATION", "TITRE_STAGE", "ETUDIANT_NOM", "DATES_STAGE"]
+    defaults = {
+        "ETUDIANT_NOM": "Alexandre Dupont",
+        "DATES_STAGE": f"Février - Août {datetime.now().year}",
+        "ENTREPRISE": "TechSolutions",
+        "ECOLE": "Université de Paris",
+        "FORMATION": "Master Informatique",
+        "TITRE_STAGE": "Développement d'une solution IA"
+    }
+
+    for k in keys_struct:
+        val = infos.get(k, "INCONNU")
+        if val == "INCONNU" or len(str(val)) < 2:
+            print(f"   [Invention] {k} manquant. Génération plausible...")
+            inv_prompt = f"""Tu dois définir : {k}.
+            Contexte du stage (Notes) : {rag_notes[:1500]}
+            Si l'info est dans les notes, extrais-la.
+            Sinon, INVENTE une valeur réaliste (ex: "{defaults.get(k, '...')}") cohérente avec le reste.
+            Réponds UNIQUEMENT par la valeur.
+            """
+            invented = llm.invoke([HumanMessage(content=inv_prompt)]).content.strip()
+            if not invented or "INCONNU" in invented or len(invented) < 2:
+                invented = defaults.get(k, "INCONNU")
+            infos[k] = invented
+            invented_keys.add(k)
+            missing_alerts.append(f"{k} (Généré : {invented})")
+            print(f"   -> {k} : {invented} (Inventé)")
+
+    # 4. Recherche Web Enrichie (Contexte Entreprise/Formation)
+    web_context = ""
+    if infos.get("ENTREPRISE") != "INCONNU" and infos.get("ENTREPRISE") != "TechSolutions":
+        print(f"   [Tavily] Recherche Activité {infos['ENTREPRISE']}...")
+        try:
+            res = internet_search.invoke(f"Activité principale {infos['ENTREPRISE']} présentation")
+            web_context += f"\n--- CONTEXTE ENTREPRISE ({infos['ENTREPRISE']}) ---\n{res[:500]}...\n"
+        except: pass
+
+    if infos.get("FORMATION") != "INCONNU" and infos.get("ECOLE") != "INCONNU":
+        print(f"   [Tavily] Recherche Programme {infos['FORMATION']} {infos['ECOLE']}...")
+        try:
+            res = internet_search.invoke(f"Programme objectifs {infos['FORMATION']} {infos['ECOLE']}")
+            web_context += f"\n--- CONTEXTE FORMATION ({infos['FORMATION']}) ---\n{res[:500]}...\n"
+        except: pass
+
+    # 5. Résolution des Personnes (Tuteurs) avec Recherche Ciblée
+    keys_people = [
+        {"key": "TUTEUR_ENTREPRISE", "label": "Tuteur Entreprise", "deps": ["ENTREPRISE"], "query": "CTO ou responsable technique {}"},
+        {"key": "TUTEUR_ECOLE", "label": "Tuteur École", "deps": ["ECOLE", "FORMATION"], "query": "Responsable pédagogique {} {}"}
+    ]
+
+    for item in keys_people:
+        k = item["key"]
+        val = infos.get(k, "INCONNU")
+        if val != "INCONNU" and len(str(val)) > 2:
+            continue 
+
+        deps = item["deps"]
+        # On cherche si les dépendances sont connues (même inventées, on tente la recherche pour voir si ça existe vraiment)
+        context_vals = [infos[d] for d in deps]
+        query = item["query"].format(*context_vals)
         
-        # On considère que si le nom est court (< 2 chars) ou générique, c'est inconnu
-        if val_clean and val_clean not in ["INCONNU", "None", "null"] and len(val_clean) > 2:
-            print(f"   [Tavily] Recherche {label} : '{val_clean}'")
-            query = query_template.format(val_clean)
+        print(f"   [Tavily] Recherche {item['label']} pour {context_vals}...")
+        found_via_search = False
+        try:
             res = internet_search.invoke(query)
-            return f"\n--- INFOS WEB {key} ({val_clean}) ---\n{res}\n"
-        else:
-            print(f"   [Info] {label} inconnu ({val}). Pas de recherche web.")
-            missing_alerts.append(label)
-            return ""
+            ext_prompt = f"""Trouve le nom de {item['label']} dans ces résultats :
+            {res}
+            Contexte : {query}
+            Si introuvable, réponds 'INCONNU'.
+            Réponds UNIQUEMENT par le nom.
+            """
+            found = llm.invoke([HumanMessage(content=ext_prompt)]).content.strip()
+            if found and "INCONNU" not in found and len(found) > 2:
+                infos[k] = found
+                found_via_search = True
+                print(f"   -> Trouvé : {found}")
+        except Exception as e: 
+            print(f"   [Erreur Web] {e}")
+        
+        if not found_via_search:
+            print(f"   [Invention] {item['label']} (Recherche vaine)...")
+            inv_prompt = f"""Invente un nom plausible pour {item['label']}.
+            Contexte : {context_vals}.
+            Réponds juste par un Prénom Nom (ex: Pierre Dupont).
+            """
+            invented = llm.invoke([HumanMessage(content=inv_prompt)]).content.strip()
+            infos[k] = invented
+            missing_alerts.append(f"{item['label']} (Inventé : {invented})")
+            print(f"   -> Inventé : {invented}")
 
-    web_infos += search_and_log("ENTREPRISE", "Entreprise {} présentation secteur chiffres clés", "Entreprise")
+    # Synthèse finale
+    user_prompt = f"Notes internes :\n{rag_notes}\n\nInfos Validées/Générées :\n{json.dumps(infos, indent=2)}\n\nContexte Web :\n{web_context}\n\nSynthétise tout pour le rapport."
+    result = call_llm(prompts.SYNTHESE_CONTEXTE.format(infos=json.dumps(infos, indent=2), web_context=web_context), user_prompt, state)
     
-    tutor_query = "Profil professionnel {}"
-    if infos.get("ENTREPRISE") and infos["ENTREPRISE"] not in ["INCONNU", "null"]:
-        tutor_query += f" {infos['ENTREPRISE']}"
-    web_infos += search_and_log("TUTEUR_ENTREPRISE", tutor_query, "Tuteur Entreprise")
-    
-    web_infos += search_and_log("ECOLE", "École {} présentation formation informatique", "École/Université")
-    web_infos += search_and_log("FORMATION", "Formation {} programme débouchés", "Formation")
-    web_infos += search_and_log("TUTEUR_ECOLE", "Profil académique chercheur {}", "Tuteur Académique")
-
-    # 4. Génération finale
-    system_prompt = """Tu es un assistant administratif expert.
-    Extrais et compile les informations du stage pour la page de garde et l'intro.
-    """
-    user_prompt = f"Notes internes :\n{rag_notes}\n\nInfos Web (Tavily) :\n{web_infos}\n\nSynthétise tout."
-    result = call_llm(system_prompt, user_prompt, state)
-    
-    placeholders = re.findall(r"\[(.*?)\]", result)
-    if placeholders:
-        for p in placeholders:
-            if "http" not in p and len(p) < 50: 
-                missing_alerts.append(f"Information manquante : {p}")
-    
-    missing_alerts = list(set(missing_alerts))
-    
-    # On stocke les infos brutes dans le state pour la page de garde HTML plus tard
     return {"context_data": {"content": result, "raw_infos": infos}, "missing_infos": missing_alerts}
 
 def coeur_rapport(state: AgentState):
-    print("--- Tâche : Corps du Rapport & Sommaire Détaillé ---")
-    
-    context_str = state.get('context_data', {}).get('content', '')
+    print("--- Tâche : Corps du Rapport ---")
     rag_notes = search_documents.invoke("Missions, tâches techniques, difficultés, réussites")
-    style_guide = consult_style_guide.invoke("Structure du développement, style rédactionnel technique")
     
-    # 1. GÉNÉRATION DU PLAN
-    print("   [1/2] Génération du Plan de Développement (5-7 parties)...")
-    parser = JsonOutputParser()
-    plan_prompt = """Tu es un architecte de contenu.
-    Analyse les notes de stage et propose un PLAN DE DÉVELOPPEMENT détaillé en 5 à 7 grandes parties techniques.
-    Format JSON : [{"titre": "...", "contenu": "..."}]
-    """
+    # Planification
+    print("   [1/2] Planification...")
     llm = get_llm()
+    parser = JsonOutputParser(pydantic_object=PlanRapport)
+    plan_prompt = """Propose un PLAN DE DÉVELOPPEMENT détaillé (6-8 parties TECHNIQUES).
+    INTERDICTION : Intro, Conclusion, Remerciements, Annexes.
+    Format JSON : {"parties": [{"titre": "...", "contenu": "..."}]}"""
+    
     try:
-        response = llm.invoke([SystemMessage(content=plan_prompt), HumanMessage(content=f"Notes :\n{rag_notes}\n\nGénère le plan JSON.")])
-        plan = parser.parse(response.content)
-        if not isinstance(plan, list): raise ValueError("Le plan n'est pas une liste.")
+        response = llm.invoke([SystemMessage(content=prompts.SECURITY_SYSTEM_PROMPT + "\n" + plan_prompt), HumanMessage(content=f"Notes :\n{rag_notes}")])
+        try: plan_data = parser.parse(response.content)
+        except: 
+            fix_resp = llm.invoke([HumanMessage(content=f"Corrige ce JSON:\n{response.content}")])
+            plan_data = parser.parse(fix_resp.content)
+        
+        plan = [p for p in plan_data.get("parties", []) if not any(x in (p.get("titre") if isinstance(p, dict) else p.titre).lower() for x in ["introduction", "conclusion", "remerciement", "annexe"])]
     except Exception as e:
         print(f"   [Erreur JSON] {e}. Fallback.")
-        return {"report_body": call_llm("Rédige le corps du rapport.", f"Notes:\n{rag_notes}", state), "sommaire": "Sommaire non généré"}
+        return {"report_body": call_llm("Rédige le corps du rapport.", f"Notes:\n{rag_notes}", state)}
 
-    # 2. RÉDACTION ITÉRATIVE
+    # Rédaction
     full_body = ""
     print(f"   [2/2] Rédaction des {len(plan)} parties...")
-    
-    for i, partie in enumerate(plan):
-        titre = partie.get("titre", f"Partie {i+1}")
-        desc = partie.get("contenu", "")
-        print(f"      -> Rédaction de : {titre}")
-        
-        part_prompt = f"""Tu es un rédacteur technique expert.
-        Rédige la partie : "{titre}".
-        Contexte : {desc}
-        
-        CONSIGNES :
-        - NE METS PAS LE TITRE DE LA PARTIE (je l'ajoute moi-même). Commence directement par le contenu.
-        - Volume : 3-5 pages.
-        - Structure : Utilise des sous-titres (##).
-        - Style : Fluide, technique, précis.
-        """
-        
-        part_content = call_llm(part_prompt, f"Notes globales :\n{rag_notes}\n\nRédige la partie '{titre}'.", state)
-        
-        # Ajout du saut de page avant chaque grande partie
-        full_body += f"<div style='page-break-before: always;'></div>\n\n# {titre}\n\n{part_content}\n\n"
+    for p in plan:
+        titre = p.get("titre") if isinstance(p, dict) else p.titre
+        desc = p.get("contenu") if isinstance(p, dict) else p.contenu
+        print(f"      -> {titre}")
+        content = call_llm(prompts.REDACTION_PARTIE.format(titre=titre, desc=desc), f"Notes:\n{rag_notes}", state)
+        full_body += f"# {titre}\n\n{content}\n\n"
 
-    # 3. SOMMAIRE
-    print("   [Info] Extraction du Sommaire Détaillé...")
-    sommaire_md = ""
-    for line in full_body.split('\n'):
-        if line.startswith("# "):
-            sommaire_md += f"- {line.replace('# ', '').strip()}\n"
-        elif line.startswith("## "):
-            sommaire_md += f"  - {line.replace('## ', '').strip()}\n"
-    
-    return {"report_body": full_body, "sommaire": sommaire_md}
+    return {"report_body": full_body}
 
 def creation_introduction(state: AgentState):
     print("--- Tâche : Introduction ---")
     context = state.get('context_data', {}).get('content', '')
+    raw_infos = state.get('context_data', {}).get('raw_infos', {})
     body_summary = state.get('report_body', '')[:1000]
     style = consult_style_guide.invoke("Exemple d'introduction")
     
-    system_prompt = """Tu es un rédacteur académique.
-    Rédige l'INTRODUCTION (Bac+5).
-    - TITRE : "# INTRODUCTION".
-    - Contenu : 3-5 pages.
-    """
-    user_prompt = f"Style :\n{style}\n\nContexte :\n{context}\n\nDébut du corps :\n{body_summary}\n\nRédige l'intro."
-    result = call_llm(system_prompt, user_prompt, state)
-    return {"introduction": result}
+    # Injection explicite des infos
+    infos_str = json.dumps(raw_infos, indent=2, ensure_ascii=False)
+    
+    return {"introduction": call_llm(prompts.REDACTION_INTRO, f"Style:\n{style}\nInfos Clés:\n{infos_str}\nContexte:\n{context}\nCorps:\n{body_summary}", state)}
 
 def creation_conclusion(state: AgentState):
     print("--- Tâche : Conclusion ---")
     body_end = state.get('report_body', '')[-1000:]
-    style = consult_style_guide.invoke("Exemple de conclusion et bilan")
-    
-    system_prompt = """Tu es un rédacteur académique.
-    Rédige la CONCLUSION (Bac+5).
-    - TITRE : "# CONCLUSION".
-    - Contenu : 3-4 pages.
-    """
-    user_prompt = f"Style :\n{style}\n\nFin du corps :\n{body_end}\n\nRédige la conclusion."
-    result = call_llm(system_prompt, user_prompt, state)
-    return {"conclusion": result}
+    style = consult_style_guide.invoke("Exemple de conclusion")
+    return {"conclusion": call_llm(prompts.REDACTION_CONCL, f"Style:\n{style}\nCorps:\n{body_end}", state)}
 
 def creation_mise_en_page(state: AgentState):
     print("--- Tâche : Assemblage & Finitions ---")
-    
     infos = state.get('context_data', {}).get('content')
-    intro = state.get('introduction')
+    raw_infos = state.get('context_data', {}).get('raw_infos', {})
     body = state.get('report_body')
-    concl = state.get('conclusion')
-    sommaire_genere = state.get('sommaire', '')
-    style_annexes = consult_style_guide.invoke("Exemple de page de garde, remerciements, avant-propos")
-
-    # Remerciements & Avant-propos
-    print("   [1/2] Génération Remerciements...")
-    system_prompt_remerciements = """Rédige les REMERCIEMENTS et l'AVANT-PROPOS.
-    TITRES : "# REMERCIEMENTS" et "# AVANT-PROPOS".
-    Sépare les deux par un saut de ligne clair.
-    """
-    user_prompt_remerciements = f"Infos :\n{infos}\n\nStyle :\n{style_annexes}\n\nRédige ces deux sections."
-    remerciements = call_llm(system_prompt_remerciements, user_prompt_remerciements, state)
+    style_annexes = consult_style_guide.invoke("Exemple de page de garde, remerciements")
+    current_date = datetime.now().strftime("%d %B %Y")
     
-    # Ajout manuel du saut de page entre Remerciements et Avant-propos si le LLM ne l'a pas fait
+    # Injection explicite des infos pour les remerciements
+    infos_str = json.dumps(raw_infos, indent=2, ensure_ascii=False)
+
+    print("   [1/3] Avant-propos...")
+    ap_prompt = f"""Rédige l'AVANT-PROPOS. TITRE : "# AVANT-PROPOS".
+    Signature : "Fait à [Ville], le {current_date}".
+    INTERDICTION DE REMERCIER ICI. Parle du contexte, de la genèse, des motivations.
+    """
+    avant_propos = call_llm(ap_prompt, f"Infos:\n{infos}\nStyle:\n{style_annexes}", state)
+
+    print("   [2/3] Remerciements...")
+    remerciements = call_llm(prompts.REDACTION_REMERCIEMENTS, f"Infos:\n{infos_str}\nStyle:\n{style_annexes}", state)
     if "# AVANT-PROPOS" in remerciements:
-        remerciements = remerciements.replace("# AVANT-PROPOS", "<div style='page-break-before: always;'></div>\n\n# AVANT-PROPOS")
+        remerciements = remerciements.replace("# AVANT-PROPOS", "\n\n# AVANT-PROPOS")
 
-    # Bibliographie
-    print("   [2/2] Génération Bibliographie...")
-    system_prompt_biblio = """Génère une BIBLIOGRAPHIE plausible.
-    TITRE : "# BIBLIOGRAPHIE".
-    """
-    user_prompt_biblio = f"Sujet :\n{body[:1000]}\n\nGénère la bibliographie."
-    biblio = call_llm(system_prompt_biblio, user_prompt_biblio, state)
+    print("   [3/3] Bibliographie...")
+    biblio = call_llm(prompts.REDACTION_BIBLIO, f"Sujet:\n{body[:1000]}", state)
 
-    layout = {
-        "avant_propos_remerciements": remerciements,
-        "sommaire": sommaire_genere,
-        "intro": intro,
-        "body": body,
-        "concl": concl,
-        "biblio": biblio
-    }
-    
-    return {"final_layout": layout}
+    return {"final_layout": {
+        "avant_propos": avant_propos, "remerciements": remerciements,
+        "intro": state.get('introduction'), "body": body, "concl": state.get('conclusion'),
+        "biblio": biblio, "raw_infos": raw_infos
+    }}
 
 def verification_humaine(state: AgentState):
     print(f"--- Vérification : {state.get('current_node')} ---")
@@ -332,136 +352,242 @@ def generation_finale(state: AgentState):
     l = state.get("final_layout", {})
     
     full_md = ""
-    # On commence par Remerciements (la page de garde est gérée par le PDF)
-    full_md += f"{l.get('avant_propos_remerciements', '')}\n\n<div style='page-break-after: always;'></div>\n\n"
-    full_md += "# SOMMAIRE\n\n" + f"{l.get('sommaire', '')}\n\n<div style='page-break-after: always;'></div>\n\n"
-    full_md += f"{l.get('intro', '')}\n\n<div style='page-break-after: always;'></div>\n\n"
-    full_md += f"{l.get('body', '')}\n\n<div style='page-break-after: always;'></div>\n\n"
-    full_md += f"{l.get('concl', '')}\n\n<div style='page-break-after: always;'></div>\n\n"
+    full_md += f"{l.get('avant_propos', '')}\n\n"
+    full_md += f"{l.get('remerciements', '')}\n\n"
+    # Sommaire géré par PDF
+    full_md += f"{l.get('intro', '')}\n\n"
+    full_md += f"{l.get('body', '')}\n\n"
+    full_md += f"{l.get('concl', '')}\n\n"
     full_md += f"{l.get('biblio', '')}\n\n"
     
     lines = full_md.split('\n')
     clean_lines = [line for line in lines if not line.strip().lower().startswith(("note :", "notes :", "notes pour", "hiérarchie visuelle"))]
     full_md = '\n'.join(clean_lines)
 
-    output_path = "Rapport_de_Stage_Final.md"
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(full_md)
-    
-    print(f"Fichier Markdown sauvegardé : {os.path.abspath(output_path)}")
+    output_path = os.path.join(OUTPUT_DIR, "Rapport_de_Stage_Final.md")
+    with open(output_path, "w", encoding="utf-8") as f: f.write(full_md)
+    print(f"Fichier Markdown sauvegardé : {output_path}")
     return state
 
 def conversion_pdf(state: AgentState):
-    print("--- CONVERSION EN PDF (AVEC PAGE DE GARDE HTML DYNAMIQUE) ---")
+    print("--- CONVERSION EN PDF ---")
+    md_path = os.path.join(OUTPUT_DIR, "Rapport_de_Stage_Final.md")
+    pdf_path = os.path.join(OUTPUT_DIR, "Rapport_de_Stage_Final.pdf")
     
-    md_path = "Rapport_de_Stage_Final.md"
-    pdf_path = "Rapport_de_Stage_Final.pdf"
-    
-    if not os.path.exists(md_path):
-        return state
+    # On utilise directement le layout structuré pour éviter les erreurs de parsing
+    layout = state.get('final_layout', {})
+    if not layout:
+        print("Erreur : Pas de layout final disponible.")
+        return {**state, "current_node": "conversion_pdf"}
         
-    # Récupération des infos brutes pour la page de garde
-    raw_infos = state.get('context_data', {}).get('raw_infos', {})
-    
-    # Valeurs par défaut si manquant
-    entreprise = raw_infos.get('ENTREPRISE', '[Nom Entreprise]')
-    if entreprise == "INCONNU": entreprise = "[Nom Entreprise]"
-    
-    tuteur = raw_infos.get('TUTEUR_ENTREPRISE', '[Nom Tuteur]')
-    if tuteur == "INCONNU": tuteur = "[Nom Tuteur]"
-    
-    tuteur_ecole = raw_infos.get('TUTEUR_ECOLE', '[Nom Tuteur École]')
-    if tuteur_ecole == "INCONNU": tuteur_ecole = "[Nom Tuteur École]"
-    
-    ecole = raw_infos.get('ECOLE', 'Université / École')
-    if ecole == "INCONNU": ecole = "Université / École"
-    
-    formation = raw_infos.get('FORMATION', 'Formation')
-    if formation == "INCONNU": formation = "Formation"
+    raw_infos = layout.get('raw_infos', {})
+    def get_info(k, default):
+        v = raw_infos.get(k, default)
+        return v if v and v not in ["INCONNU", "null", "None"] else default
+
+    entreprise = get_info('ENTREPRISE', "Entreprise d'Accueil")
+    tuteur = get_info('TUTEUR_ENTREPRISE', "Tuteur Entreprise")
+    tuteur_ecole = get_info('TUTEUR_ECOLE', "Tuteur Académique")
+    ecole = get_info('ECOLE', "Université / École")
+    formation = get_info('FORMATION', "Formation")
+    titre_stage = get_info('TITRE_STAGE', "RAPPORT DE STAGE")
+    etudiant_nom = get_info('ETUDIANT_NOM', "Prénom Nom")
+    etudiant_contact = get_info('ETUDIANT_CONTACT', "email@etudiant.fr")
+    dates_stage = get_info('DATES_STAGE', "Dates du stage")
     
     try:
-        with open(md_path, "r", encoding="utf-8") as f:
-            text = f.read()
-            
-        current_date = datetime.now().strftime("%B %Y")
+        months = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+        now = datetime.now()
+        # Sécurisation du calcul de la date
+        current_date_fr = f"{months[int(now.month)-1]} {now.year}"
         
+        # --- CSS AMÉLIORÉ ---
+        css = """
+        <style>
+            @page { 
+                size: A4; 
+                margin: 2.5cm; 
+                @frame footer_frame { 
+                    -pdf-frame-content: footer_content; 
+                    bottom: 1cm; 
+                    margin-left: 2.5cm; 
+                    margin-right: 2.5cm; 
+                    height: 1cm; 
+                } 
+            }
+            @page cover_page {
+                size: A4;
+                margin: 1cm;
+                background-color: #ffffff;
+            }
+            
+            body { font-family: Helvetica, Arial, sans-serif; font-size: 11pt; line-height: 1.5; text-align: justify; color: #333; }
+            
+            /* Titres */
+            h1 { 
+                color: #2c3e50; 
+                font-size: 24pt; 
+                margin-top: 0; 
+                margin-bottom: 30px; 
+                padding-bottom: 10px;
+                border-bottom: 2px solid #2c3e50;
+                page-break-before: always;
+                -pdf-keep-with-next: true;
+            }
+            h2 { 
+                color: #34495e; 
+                font-size: 18pt; 
+                margin-top: 35px; 
+                margin-bottom: 15px; 
+                page-break-after: avoid;
+                -pdf-keep-with-next: true;
+            }
+            h3 { 
+                color: #7f8c8d; 
+                font-size: 14pt; 
+                margin-top: 20px; 
+                margin-bottom: 10px; 
+                page-break-after: avoid;
+                -pdf-keep-with-next: true;
+            }
+            
+            /* Sommaire */
+            pdftoc { color: #2c3e50; }
+            pdftoc.pdftoclevel0 { 
+                font-weight: bold; 
+                margin-top: 12px; 
+                color: #2c3e50; 
+                font-size: 12pt;
+            }
+            pdftoc.pdftoclevel1 { 
+                margin-left: 25px; 
+                font-size: 11pt; 
+                color: #555; 
+                font-style: italic;
+            }
+            
+            /* Tables et Listes */
+            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; page-break-inside: avoid; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; font-weight: bold; }
+            
+            ul, ol { margin-bottom: 10px; padding-left: 20px; }
+            li { margin-bottom: 5px; }
+            
+            /* Page de garde - Design vertical centré pour éviter les bugs de tableau */
+            .cover-container { text-align: center; padding-top: 50px; }
+            .cover-title { font-size: 40pt; color: #2c3e50; margin-bottom: 10px; font-weight: bold; }
+            .cover-subtitle { font-size: 22pt; color: #7f8c8d; margin-bottom: 50px; }
+            .cover-box { border-top: 3px solid #34495e; border-bottom: 3px solid #34495e; padding: 30px; margin: 0 20px; background-color: #f9f9f9; }
+            .cover-subject { font-size: 24pt; font-weight: bold; color: #34495e; line-height: 1.3; }
+            .cover-student { font-size: 18pt; font-weight: bold; color: #2c3e50; margin-top: 40px; }
+            .cover-contact { font-size: 12pt; color: #7f8c8d; }
+            .cover-school { margin-top: 20px; font-size: 14pt; }
+            .cover-dates { font-style: italic; color: #7f8c8d; margin-top: 5px; }
+            
+            .cover-mentors { margin-top: 50px; font-size: 13pt; line-height: 1.6; }
+            .mentor-block { margin-bottom: 20px; }
+            .mentor-label { color: #7f8c8d; font-size: 11pt; text-transform: uppercase; letter-spacing: 1px; }
+            
+            .cover-footer { position: absolute; bottom: 0; width: 100%; text-align: center; font-size: 12pt; color: #7f8c8d; }
+        </style>
+        """
+        
+        # --- PAGE DE GARDE SANS TABLEAU ---
         cover_html = f"""
-        <div id="cover">
-            <div style="text-align: center; margin-top: 50px;">
-                <h1 style="font-size: 36pt; color: #2c3e50; margin-bottom: 20px;">RAPPORT DE STAGE</h1>
-                <h2 style="font-size: 20pt; color: #34495e; margin-bottom: 10px;">Fin d'Études - Ingénieur Informatique</h2>
-                <h3 style="font-size: 16pt; color: #7f8c8d; margin-bottom: 50px;">{formation} - {ecole}</h3>
-                
-                <div style="border: 2px solid #2c3e50; padding: 20px; margin: 50px 20px;">
-                    <p style="font-size: 18pt; font-weight: bold;">TITRE DU SUJET</p>
+        <div class="cover-container">
+            <div class="cover-title">RAPPORT DE STAGE</div>
+            <div class="cover-subtitle">Fin d'Études - Ingénieur Informatique</div>
+            
+            <div class="cover-box">
+                <div class="cover-subject">{titre_stage}</div>
+            </div>
+            
+            <div class="cover-student">{etudiant_nom}</div>
+            <div class="cover-contact">{etudiant_contact}</div>
+            
+            <div class="cover-school">
+                <strong>{formation}</strong><br/>
+                {ecole}
+            </div>
+            <div class="cover-dates">{dates_stage}</div>
+            
+            <div class="cover-mentors">
+                <div class="mentor-block">
+                    <span class="mentor-label">Entreprise d'accueil</span><br/>
+                    <strong>{entreprise}</strong><br/>
+                    {tuteur}
                 </div>
                 
-                <div style="margin-top: 80px; font-size: 14pt; text-align: left; margin-left: 20%;">
-                    <p><strong>Entreprise :</strong> {entreprise}</p>
-                    <p><strong>Tuteur Entreprise :</strong> {tuteur}</p>
-                    <p><strong>Tuteur École :</strong> {tuteur_ecole}</p>
+                <div class="mentor-block">
+                    <span class="mentor-label">Tuteur Académique</span><br/>
+                    <strong>{tuteur_ecole}</strong>
                 </div>
-                
-                <div style="position: absolute; bottom: 20px; width: 100%; text-align: center;">
-                    <p style="font-size: 12pt;">{current_date}</p>
-                </div>
+            </div>
+            
+            <div class="cover-footer">
+                {current_date_fr}
             </div>
         </div>
         <pdf:next template="body_template" />
         """
         
-        css = """
-        <style>
-            @page {
-                size: A4;
-                margin: 2.5cm;
-                @frame footer_frame {
-                    -pdf-frame-content: footer_content;
-                    bottom: 1cm;
-                    margin-left: 2.5cm;
-                    margin-right: 2.5cm;
-                    height: 1cm;
-                }
-            }
-            @page body_template {
-                margin: 2.5cm;
-            }
+        # --- ASSEMBLAGE DU CONTENU ---
+        # On construit le HTML bloc par bloc pour éviter les problèmes de parsing global
+        
+        html_parts = []
+        html_parts.append(cover_html)
+        
+        # Avant-Propos & Remerciements
+        if layout.get('avant_propos'):
+            html_parts.append(markdown.markdown(layout['avant_propos']))
+        
+        if layout.get('remerciements'):
+            # On force un saut de page si besoin, mais H1 le fait déjà
+            html_parts.append(markdown.markdown(layout['remerciements']))
             
-            body { font-family: Helvetica, Arial, sans-serif; font-size: 11pt; line-height: 1.5; text-align: justify; }
-            h1 { color: #2c3e50; font-size: 22pt; margin-top: 30px; margin-bottom: 15px; page-break-after: avoid; }
-            h2 { color: #34495e; font-size: 16pt; margin-top: 20px; margin-bottom: 10px; border-bottom: 1px solid #eee; page-break-after: avoid; }
-            h3 { color: #7f8c8d; font-size: 14pt; margin-top: 15px; margin-bottom: 8px; page-break-after: avoid; }
-            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; page-break-inside: avoid; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #f2f2f2; font-weight: bold; }
-            ul, ol { margin-bottom: 10px; padding-left: 20px; }
-            li { margin-bottom: 5px; }
-            #cover { height: 100%; width: 100%; }
-        </style>
-        """
-        
-        html_content = markdown.markdown(text, extensions=['tables'])
-        
-        footer_html = """
-        <div id="footer_content" style="text-align: center; font-size: 10pt;">
-            Page <pdf:pagenumber />
+        # Sommaire (Page dédiée)
+        toc_html = """
+        <div id="toc">
+            <h1 style="border-bottom: none; text-align: center; margin-bottom: 40px;">SOMMAIRE</h1>
+            <pdf:toc />
         </div>
+        <pdf:next template="body_template" />
         """
+        html_parts.append(toc_html)
         
-        full_html = f"<html><head>{css}</head><body>{cover_html}{html_content}{footer_html}</body></html>"
+        # Corps du rapport
+        if layout.get('intro'):
+            html_parts.append(markdown.markdown(layout['intro']))
+            
+        if layout.get('body'):
+            html_parts.append(markdown.markdown(layout['body'], extensions=['tables']))
+            
+        if layout.get('concl'):
+            html_parts.append(markdown.markdown(layout['concl']))
+            
+        if layout.get('biblio'):
+            html_parts.append(markdown.markdown(layout['biblio']))
+            
+        # Footer
+        footer_html = """<div id="footer_content" style="text-align: center; font-size: 10pt; color: #7f8c8d;">Page <pdf:pagenumber /></div>"""
+        
+        # Concaténation finale
+        full_content = "".join(html_parts)
+        full_html = f"<html><head>{css}</head><body>{full_content}{footer_html}</body></html>"
         
         with open(pdf_path, "wb") as pdf_file:
             pisa_status = pisa.CreatePDF(full_html, dest=pdf_file)
             
-        if pisa_status.err:
-            print("Erreur lors de la conversion PDF.")
-        else:
-            print(f"Fichier PDF généré avec succès : {os.path.abspath(pdf_path)}")
+        if pisa_status.err: print("Erreur lors de la conversion PDF.")
+        else: print(f"Fichier PDF généré avec succès : {os.path.abspath(pdf_path)}")
             
-    except Exception as e:
+    except Exception as e: 
         print(f"Exception lors de la conversion PDF : {e}")
+        traceback.print_exc()
         
-    return state
+    # On retourne l'état avec current_node mis à jour pour signaler la fin
+    return {**state, "current_node": "conversion_pdf"}
 
 def route_after_human(state: AgentState):
     return "valide" if state.get("human_approved") else "refuse"
@@ -480,33 +606,17 @@ workflow.add_node("generation", generation_finale)
 workflow.add_node("conversion_pdf", conversion_pdf)
 
 workflow.set_entry_point("orchestrateur")
-
-workflow.add_conditional_edges(
-    "orchestrateur",
-    lambda x: x["current_node"],
-    {
-        "contexte": "contexte",
-        "corps_rapport": "corps_rapport",
-        "introduction": "introduction",
-        "conclusion": "conclusion",
-        "mise_en_page": "mise_en_page",
-        "generation": "generation",
-        "conversion_pdf": "conversion_pdf"
-    }
-)
-
-for t in ["contexte", "corps_rapport", "introduction", "conclusion", "mise_en_page"]:
-    workflow.add_edge(t, "verification_humaine")
-
-workflow.add_conditional_edges(
-    "verification_humaine",
-    route_after_human,
-    {
-        "valide": "orchestrateur",
-        "refuse": "orchestrateur"
-    }
-)
-
+workflow.add_conditional_edges("orchestrateur", lambda x: x["current_node"], {
+    "contexte": "contexte",
+    "corps_rapport": "corps_rapport",
+    "introduction": "introduction",
+    "conclusion": "conclusion",
+    "mise_en_page": "mise_en_page",
+    "generation": "generation",
+    "conversion_pdf": "conversion_pdf"
+})
+for t in ["contexte", "corps_rapport", "introduction", "conclusion", "mise_en_page"]: workflow.add_edge(t, "verification_humaine")
+workflow.add_conditional_edges("verification_humaine", route_after_human, {"valide": "orchestrateur", "refuse": "orchestrateur"})
 workflow.add_edge("generation", "conversion_pdf")
 workflow.add_edge("conversion_pdf", END)
 
