@@ -1,2 +1,36 @@
-*.env
-!.env.example
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environnement Virtuel ---
+venv/
+.venv/
+env/
+
+# --- Secrets & Configuration (CRITIQUE) ---
+.env
+.env.local
+config_local.py
+
+# --- IDE & Système ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Fichiers Générés & Données ---
+output/
+*.pdf
+*.log
+mlruns/
+.trash/
+db/
+data/
+*.db
+*.sqlite3
+
+# --- Exceptions ---
+!README.md
+!roadmap.md
