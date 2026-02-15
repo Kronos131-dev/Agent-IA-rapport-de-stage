@@ -47,16 +47,18 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
     text = re.sub(r"<img.*?>", "", text)
     text = re.sub(r"^(Voici|Je vous propose|Ci-dessous).*?:\n", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    stop_patterns = [r"\nNotes? de personnalisation", r"\nNotes? pour", r"\nConseils? :", r"\nExemple d['’]adaptation", r"\n---"]
+    
+    # Correction : Suppression de "---" qui coupait le texte trop tôt
+    stop_patterns = [r"\nNotes? de personnalisation", r"\nNotes? pour", r"\nConseils? :", r"\nExemple d['’]adaptation"]
     for pattern in stop_patterns:
         split_text = re.split(pattern, text, flags=re.IGNORECASE)
         if len(split_text) > 1: text = split_text[0]
+        
     lines = text.split('\n')
     cleaned_lines = []
     for line in lines:
         if line.strip().startswith('#'):
             line = line.replace('**', '')
-            if " : " in line: line = line.split(" : ")[0]
         cleaned_lines.append(line)
     return '\n'.join(cleaned_lines).strip()
 
@@ -70,7 +72,9 @@ def call_llm(system_prompt: str, user_prompt: str, state: AgentState):
     previous_output = state.get("previous_output")
     if feedback:
         if not validate_input(feedback): feedback = "Feedback ignoré."
-        if previous_output: content += f"\n\n--- MODE CORRECTION ---\nPrécédent refusé :\n{previous_output}\n\nFeedback :\n{feedback}\n\nCorrige en conséquence."
+        # Correction : Instruction explicite pour régénérer tout le contenu
+        if previous_output: 
+            content += f"\n\n--- MODE CORRECTION ---\nPrécédent refusé :\n{previous_output}\n\nFeedback :\n{feedback}\n\nCONSIGNE : RÉGÉNÈRE L'INTÉGRALITÉ DU CONTENU EN PRENANT EN COMPTE LE FEEDBACK. NE FAIS PAS JUSTE UNE LISTE DE MODIFICATIONS."
     messages.append(HumanMessage(content=content))
     response = llm.invoke(messages).content
     return clean_markdown(response)
@@ -78,20 +82,28 @@ def call_llm(system_prompt: str, user_prompt: str, state: AgentState):
 # --- NOEUDS ---
 
 def noeud_orchestrateur(state: AgentState):
-    print("\n[Orchestrateur] Analyse...")
+    # print("\n[Orchestrateur] Analyse...")
     last = state.get("last_validated")
     current = state.get("current_node")
     sequence = ["contexte", "corps_rapport", "introduction", "conclusion", "mise_en_page", "generation", "conversion_pdf"]
+    
+    # Gestion des erreurs de boucle (retry automatique)
+    if state.get("retry_node"):
+        next_node = state.get("retry_node")
+        # print(f"[Orchestrateur] Retry automatique -> {next_node}")
+        return {"current_node": next_node, "retry_node": None, "human_approved": False}
+
     if not last: next_node = "contexte"
     else:
         try: idx = sequence.index(last); next_node = sequence[idx + 1] if idx + 1 < len(sequence) else "conversion_pdf"
         except ValueError: next_node = "conversion_pdf"
+    
     updates = {"current_node": next_node, "human_approved": False}
     if next_node != current:
-        print(f"[Orchestrateur] -> {next_node}")
+        # print(f"[Orchestrateur] -> {next_node}")
         updates.update({"user_feedback": None, "previous_output": None, "revision_count": 0})
     else:
-        print(f"[Orchestrateur] Révision pour {next_node}")
+        # print(f"[Orchestrateur] Révision pour {next_node}")
         updates["revision_count"] = state.get("revision_count", 0) + 1
     return updates
 
@@ -106,7 +118,7 @@ def demande_infos_contexte(state: AgentState):
     feedback = state.get("user_feedback")
     
     if feedback and validate_input(feedback):
-        print(f"   [Correction] Analyse du feedback...")
+        # print(f"   [Correction] Analyse du feedback...")
         infos = existing_infos.copy()
         try:
             fb_response = llm.invoke([
@@ -118,19 +130,19 @@ def demande_infos_contexte(state: AgentState):
             # Mise à jour intelligente avec Reset des dépendances
             for k, v in fb_infos.items():
                 if v and v not in ["null", "None", "INCONNU", "NON_MENTIONNE"]:
-                    print(f"   -> Mise à jour {k} : {v}")
+                    # print(f"   -> Mise à jour {k} : {v}")
                     infos[k] = v
                     
                     # LOGIQUE DE RESET : Si l'école/formation change, on oublie le tuteur inventé pour forcer la recherche
                     if k in ["ECOLE", "FORMATION"]:
                         # On ne reset que si l'utilisateur n'a PAS donné le tuteur dans le même feedback
                         if "TUTEUR_ECOLE" not in fb_infos or fb_infos["TUTEUR_ECOLE"] in ["null", "None", "INCONNU"]:
-                            print("   [Reset] Nouvelle formation/école détectée -> Recherche d'un nouveau tuteur...")
+                            # print("   [Reset] Nouvelle formation/école détectée -> Recherche d'un nouveau tuteur...")
                             infos["TUTEUR_ECOLE"] = "INCONNU"
                     
                     if k == "ENTREPRISE":
                         if "TUTEUR_ENTREPRISE" not in fb_infos or fb_infos["TUTEUR_ENTREPRISE"] in ["null", "None", "INCONNU"]:
-                            print("   [Reset] Nouvelle entreprise détectée -> Recherche d'un nouveau tuteur...")
+                            # print("   [Reset] Nouvelle entreprise détectée -> Recherche d'un nouveau tuteur...")
                             infos["TUTEUR_ENTREPRISE"] = "INCONNU"
 
         except: pass
@@ -147,9 +159,17 @@ def demande_infos_contexte(state: AgentState):
     else:
         infos = existing_infos
 
-    # Nettoyage
+    # Nettoyage et Détection de Noms Génériques
+    generic_terms = ["conseiller", "académique", "tuteur", "responsable", "pédagogique", "maître", "stage", "professeur", "inconnu", "non mentionné"]
     for k, v in infos.items():
-        if v in ["None", "null", None]: infos[k] = "INCONNU"
+        if v in ["None", "null", None]: 
+            infos[k] = "INCONNU"
+        elif isinstance(v, str):
+            # Si le nom contient trop de termes génériques, on le considère comme INCONNU pour forcer la recherche
+            if any(term in v.lower() for term in generic_terms) and len(v.split()) < 4: 
+                 if k in ["TUTEUR_ECOLE", "TUTEUR_ENTREPRISE"]:
+                     # print(f"   [Nettoyage] Nom générique détecté pour {k} ({v}) -> Reset à INCONNU")
+                     infos[k] = "INCONNU"
 
     invented_keys = set()
     missing_alerts = []
@@ -158,7 +178,7 @@ def demande_infos_contexte(state: AgentState):
     if infos.get("ETUDIANT_NOM") != "INCONNU" and (infos.get("ETUDIANT_CONTACT") == "INCONNU" or "email" in str(infos.get("ETUDIANT_CONTACT"))):
         nom_clean = infos["ETUDIANT_NOM"].lower().replace(" ", ".").replace("é", "e")
         infos["ETUDIANT_CONTACT"] = f"{nom_clean}@gmail.com"
-        print(f"   [Déduction] Email généré : {infos['ETUDIANT_CONTACT']}")
+        # print(f"   [Déduction] Email généré : {infos['ETUDIANT_CONTACT']}")
 
     # 3. Résolution des Structures (Entreprise, Ecole, Formation)
     keys_struct = ["ENTREPRISE", "ECOLE", "FORMATION", "TITRE_STAGE", "ETUDIANT_NOM", "DATES_STAGE"]
@@ -174,7 +194,7 @@ def demande_infos_contexte(state: AgentState):
     for k in keys_struct:
         val = infos.get(k, "INCONNU")
         if val == "INCONNU" or len(str(val)) < 2:
-            print(f"   [Invention] {k} manquant. Génération plausible...")
+            # print(f"   [Invention] {k} manquant. Génération plausible...")
             inv_prompt = f"""Tu dois définir : {k}.
             Contexte du stage (Notes) : {rag_notes[:1500]}
             Si l'info est dans les notes, extrais-la.
@@ -187,19 +207,22 @@ def demande_infos_contexte(state: AgentState):
             infos[k] = invented
             invented_keys.add(k)
             missing_alerts.append(f"{k} (Généré : {invented})")
-            print(f"   -> {k} : {invented} (Inventé)")
+            # print(f"   -> {k} : {invented} (Inventé)")
 
-    # 4. Recherche Web Enrichie (Contexte Entreprise/Formation)
+    # 4. Recherche Web Enrichie (Contexte Entreprise/Formation/Tuteurs)
     web_context = ""
+    
+    # Recherche Entreprise
     if infos.get("ENTREPRISE") != "INCONNU" and infos.get("ENTREPRISE") != "TechSolutions":
-        print(f"   [Tavily] Recherche Activité {infos['ENTREPRISE']}...")
+        # print(f"   [Tavily] Recherche Activité {infos['ENTREPRISE']}...")
         try:
             res = internet_search.invoke(f"Activité principale {infos['ENTREPRISE']} présentation")
             web_context += f"\n--- CONTEXTE ENTREPRISE ({infos['ENTREPRISE']}) ---\n{res[:500]}...\n"
         except: pass
 
+    # Recherche Formation/École
     if infos.get("FORMATION") != "INCONNU" and infos.get("ECOLE") != "INCONNU":
-        print(f"   [Tavily] Recherche Programme {infos['FORMATION']} {infos['ECOLE']}...")
+        # print(f"   [Tavily] Recherche Programme {infos['FORMATION']} {infos['ECOLE']}...")
         try:
             res = internet_search.invoke(f"Programme objectifs {infos['FORMATION']} {infos['ECOLE']}")
             web_context += f"\n--- CONTEXTE FORMATION ({infos['FORMATION']}) ---\n{res[:500]}...\n"
@@ -208,50 +231,74 @@ def demande_infos_contexte(state: AgentState):
     # 5. Résolution des Personnes (Tuteurs) avec Recherche Ciblée
     keys_people = [
         {"key": "TUTEUR_ENTREPRISE", "label": "Tuteur Entreprise", "deps": ["ENTREPRISE"], "query": "CTO ou responsable technique {}"},
-        {"key": "TUTEUR_ECOLE", "label": "Tuteur École", "deps": ["ECOLE", "FORMATION"], "query": "Responsable pédagogique {} {}"}
+        {"key": "TUTEUR_ECOLE", "label": "Tuteur Académique", "deps": ["ECOLE", "FORMATION"], "query": "Responsable pédagogique {} {}"}
     ]
 
     for item in keys_people:
         k = item["key"]
         val = infos.get(k, "INCONNU")
+        
+        # Si le nom est déjà connu, on cherche des infos sur lui
         if val != "INCONNU" and len(str(val)) > 2:
+            # print(f"   [Tavily] Recherche infos sur {item['label']} ({val})...")
+            try:
+                res = internet_search.invoke(f"{val} {infos[item['deps'][0]]} profil")
+                web_context += f"\n--- CONTEXTE {item['label'].upper()} ({val}) ---\n{res[:300]}...\n"
+            except: pass
             continue 
 
         deps = item["deps"]
         # On cherche si les dépendances sont connues (même inventées, on tente la recherche pour voir si ça existe vraiment)
         context_vals = [infos[d] for d in deps]
+        
+        # --- CORRECTION MAJEURE : On ne lance la recherche que si les dépendances ne sont PAS inventées ---
+        # Si l'école ou la formation vient d'être inventée (contient "Inventé" ou est générique), on ne cherche pas le tuteur
+        deps_are_invented = any("Inventé" in str(infos[d]) or "INCONNU" in str(infos[d]) for d in deps)
+        
+        if deps_are_invented:
+             # print(f"   [Info] Recherche {item['label']} reportée (Dépendances inventées/inconnues).")
+             infos[k] = "INCONNU"
+             missing_alerts.append(f"{item['label']} (En attente d'infos)")
+             continue
+
         query = item["query"].format(*context_vals)
         
-        print(f"   [Tavily] Recherche {item['label']} pour {context_vals}...")
+        # print(f"   [Tavily] Recherche {item['label']} pour {context_vals}...")
         found_via_search = False
         try:
             res = internet_search.invoke(query)
-            ext_prompt = f"""Trouve le nom de {item['label']} dans ces résultats :
-            {res}
-            Contexte : {query}
-            Si introuvable, réponds 'INCONNU'.
-            Réponds UNIQUEMENT par le nom.
-            """
+            ext_prompt = prompts.EXTRACTION_INVENTION.format(label=item['label'], res=res)
             found = llm.invoke([HumanMessage(content=ext_prompt)]).content.strip()
             if found and "INCONNU" not in found and len(found) > 2:
                 infos[k] = found
                 found_via_search = True
-                print(f"   -> Trouvé : {found}")
+                # print(f"   -> Trouvé : {found}")
+                # On ajoute le contexte trouvé
+                web_context += f"\n--- CONTEXTE {item['label'].upper()} (Trouvé) ---\n{res[:300]}...\n"
         except Exception as e: 
-            print(f"   [Erreur Web] {e}")
+            # print(f"   [Erreur Web] {e}")
+            pass
         
         if not found_via_search:
-            print(f"   [Invention] {item['label']} (Recherche vaine)...")
-            inv_prompt = f"""Invente un nom plausible pour {item['label']}.
-            Contexte : {context_vals}.
-            Réponds juste par un Prénom Nom (ex: Pierre Dupont).
-            """
-            invented = llm.invoke([HumanMessage(content=inv_prompt)]).content.strip()
-            infos[k] = invented
-            missing_alerts.append(f"{item['label']} (Inventé : {invented})")
-            print(f"   -> Inventé : {invented}")
+            # Si on n'a pas trouvé, on laisse INCONNU pour l'instant si c'est le tuteur académique
+            # pour éviter d'inventer trop vite si l'utilisateur vient de donner l'école
+            if k == "TUTEUR_ECOLE" and feedback:
+                 # print(f"   [Info] {item['label']} non trouvé, laissé INCONNU pour correction ultérieure.")
+                 infos[k] = "INCONNU"
+                 missing_alerts.append(f"{item['label']} (Manquant)")
+            else:
+                # print(f"   [Invention] {item['label']} (Recherche vaine)...")
+                inv_prompt = f"""Invente un nom plausible pour {item['label']}.
+                Contexte : {context_vals}.
+                Réponds juste par un Prénom Nom (ex: Pierre Dupont).
+                """
+                invented = llm.invoke([HumanMessage(content=inv_prompt)]).content.strip()
+                infos[k] = invented
+                missing_alerts.append(f"{item['label']} (Inventé : {invented})")
+                # print(f"   -> Inventé : {invented}")
 
     # Synthèse finale
+    # On force l'inclusion de TOUS les contextes trouvés
     user_prompt = f"Notes internes :\n{rag_notes}\n\nInfos Validées/Générées :\n{json.dumps(infos, indent=2)}\n\nContexte Web :\n{web_context}\n\nSynthétise tout pour le rapport."
     result = call_llm(prompts.SYNTHESE_CONTEXTE.format(infos=json.dumps(infos, indent=2), web_context=web_context), user_prompt, state)
     
@@ -262,12 +309,10 @@ def coeur_rapport(state: AgentState):
     rag_notes = search_documents.invoke("Missions, tâches techniques, difficultés, réussites")
     
     # Planification
-    print("   [1/2] Planification...")
+    print("   [1/2] Planification des parties...")
     llm = get_llm()
     parser = JsonOutputParser(pydantic_object=PlanRapport)
-    plan_prompt = """Propose un PLAN DE DÉVELOPPEMENT détaillé (6-8 parties TECHNIQUES).
-    INTERDICTION : Intro, Conclusion, Remerciements, Annexes.
-    Format JSON : {"parties": [{"titre": "...", "contenu": "..."}]}"""
+    plan_prompt = prompts.PLANIFICATION_CORPS
     
     try:
         response = llm.invoke([SystemMessage(content=prompts.SECURITY_SYSTEM_PROMPT + "\n" + plan_prompt), HumanMessage(content=f"Notes :\n{rag_notes}")])
@@ -276,19 +321,40 @@ def coeur_rapport(state: AgentState):
             fix_resp = llm.invoke([HumanMessage(content=f"Corrige ce JSON:\n{response.content}")])
             plan_data = parser.parse(fix_resp.content)
         
-        plan = [p for p in plan_data.get("parties", []) if not any(x in (p.get("titre") if isinstance(p, dict) else p.titre).lower() for x in ["introduction", "conclusion", "remerciement", "annexe"])]
+        # --- CORRECTION JSON : Gestion robuste du format ---
+        if plan_data is None:
+            raise ValueError("Le JSON parsé est vide (None).")
+            
+        if isinstance(plan_data, list):
+            raw_parties = plan_data
+        else:
+            raw_parties = plan_data.get("parties", [])
+            
+        if not raw_parties:
+             raise ValueError("Aucune partie trouvée dans le plan.")
+
+        plan = [p for p in raw_parties if not any(x in (p.get("titre") if isinstance(p, dict) else p.titre).lower() for x in ["introduction", "conclusion", "remerciement", "annexe"])]
+        
     except Exception as e:
-        print(f"   [Erreur JSON] {e}. Fallback.")
-        return {"report_body": call_llm("Rédige le corps du rapport.", f"Notes:\n{rag_notes}", state)}
+        print(f"   [Attention] Échec de la planification automatique ({e}). Utilisation d'un plan standard.")
+        # Plan de secours robuste pour éviter le blocage
+        plan = [
+            {"titre": "Analyse du Contexte et des Besoins", "contenu": "Analyse approfondie de l'environnement, des enjeux et des objectifs du projet."},
+            {"titre": "État de l'Art et Choix Techniques", "contenu": "Étude des solutions existantes, comparatif technologique et justification des choix."},
+            {"titre": "Conception et Architecture", "contenu": "Architecture détaillée de la solution, modélisation des données et des flux."},
+            {"titre": "Réalisation et Développement", "contenu": "Description technique des développements majeurs, algorithmes et code."},
+            {"titre": "Challenges Techniques et Solutions", "contenu": "Focus sur les difficultés rencontrées et les solutions techniques apportées."},
+            {"titre": "Tests, Validation et Résultats", "contenu": "Protocole de tests, résultats obtenus et validation par rapport aux objectifs."}
+        ]
 
     # Rédaction
     full_body = ""
-    print(f"   [2/2] Rédaction des {len(plan)} parties...")
+    print(f"   [2/2] Rédaction des {len(plan)} parties techniques...")
     for p in plan:
         titre = p.get("titre") if isinstance(p, dict) else p.titre
         desc = p.get("contenu") if isinstance(p, dict) else p.contenu
-        print(f"      -> {titre}")
-        content = call_llm(prompts.REDACTION_PARTIE.format(titre=titre, desc=desc), f"Notes:\n{rag_notes}", state)
+        print(f"      > Rédaction : {titre}...")
+        content = call_llm(prompts.REDACTION_PARTIE.format(titre=titre, desc=desc), f"Notes complètes du stage (RAG):\n{rag_notes}", state)
         full_body += f"# {titre}\n\n{content}\n\n"
 
     return {"report_body": full_body}
@@ -303,7 +369,7 @@ def creation_introduction(state: AgentState):
     # Injection explicite des infos
     infos_str = json.dumps(raw_infos, indent=2, ensure_ascii=False)
     
-    return {"introduction": call_llm(prompts.REDACTION_INTRO, f"Style:\n{style}\nInfos Clés:\n{infos_str}\nContexte:\n{context}\nCorps:\n{body_summary}", state)}
+    return {"introduction": call_llm(prompts.REDACTION_INTRO.format(context=context), f"Style:\n{style}\nInfos Clés:\n{infos_str}\nCorps:\n{body_summary}", state)}
 
 def creation_conclusion(state: AgentState):
     print("--- Tâche : Conclusion ---")
@@ -321,20 +387,22 @@ def creation_mise_en_page(state: AgentState):
     
     # Injection explicite des infos pour les remerciements
     infos_str = json.dumps(raw_infos, indent=2, ensure_ascii=False)
+    
+    # Tentative de déduction de la ville
+    ville = "Calais" # Par défaut pour ULCO
+    if "paris" in str(raw_infos.get("ECOLE", "")).lower(): ville = "Paris"
+    elif "lyon" in str(raw_infos.get("ECOLE", "")).lower(): ville = "Lyon"
 
-    print("   [1/3] Avant-propos...")
-    ap_prompt = f"""Rédige l'AVANT-PROPOS. TITRE : "# AVANT-PROPOS".
-    Signature : "Fait à [Ville], le {current_date}".
-    INTERDICTION DE REMERCIER ICI. Parle du contexte, de la genèse, des motivations.
-    """
-    avant_propos = call_llm(ap_prompt, f"Infos:\n{infos}\nStyle:\n{style_annexes}", state)
+    # print("   [1/3] Avant-propos...")
+    ap_prompt = prompts.REDACTION_AVANT_PROPOS.format(date=current_date, ville=ville, infos=infos)
+    avant_propos = call_llm(ap_prompt, f"Style:\n{style_annexes}", state)
 
-    print("   [2/3] Remerciements...")
-    remerciements = call_llm(prompts.REDACTION_REMERCIEMENTS, f"Infos:\n{infos_str}\nStyle:\n{style_annexes}", state)
+    # print("   [2/3] Remerciements...")
+    remerciements = call_llm(prompts.REDACTION_REMERCIEMENTS.format(infos=infos), f"Style:\n{style_annexes}", state)
     if "# AVANT-PROPOS" in remerciements:
         remerciements = remerciements.replace("# AVANT-PROPOS", "\n\n# AVANT-PROPOS")
 
-    print("   [3/3] Bibliographie...")
+    # print("   [3/3] Bibliographie...")
     biblio = call_llm(prompts.REDACTION_BIBLIO, f"Sujet:\n{body[:1000]}", state)
 
     return {"final_layout": {
@@ -383,6 +451,12 @@ def conversion_pdf(state: AgentState):
     raw_infos = layout.get('raw_infos', {})
     def get_info(k, default):
         v = raw_infos.get(k, default)
+        # Nettoyage final des variables pour la page de garde
+        if v and isinstance(v, str):
+            # Enlever tout ce qui est entre parenthèses ou après un tiret explicatif
+            v = re.sub(r"\(.*?\)", "", v)
+            v = v.split(" - ")[0]
+            v = v.strip()
         return v if v and v not in ["INCONNU", "null", "None"] else default
 
     entreprise = get_info('ENTREPRISE', "Entreprise d'Accueil")

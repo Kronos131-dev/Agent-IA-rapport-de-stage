@@ -10,10 +10,12 @@ class AgentState(TypedDict):
     revision_count: int
     
     missing_infos: Optional[List[str]]
+    retry_node: Optional[str]
+    retry_count: int # Compteur pour éviter les boucles infinies de retry
     
     # Données du rapport
     context_data: dict
-    style_rules: str    # Nouvelles règles de style extraites de l'exemple
+    style_rules: str
     report_body: str
     sommaire: str
     introduction: str
